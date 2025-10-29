@@ -85,43 +85,49 @@ func Compare(before, after *LiveAggregate, op string) (*bench.Comparison, error)
 		if a.Requests > 0 || b.Requests > 0 {
 			ms := float64(time.Millisecond)
 			const round = 100 * time.Microsecond
-			aInv := 1.0 / max(1, float64(a.MergedEntries))
-			bInv := 1.0 / max(1, float64(b.MergedEntries))
+			// Compute average object sizes defensively when entries can be zero
+			avgObjSize := func(sz int64, merged int) int64 {
+				if merged > 0 {
+					return sz / int64(merged)
+				}
+				return sz
+			}
 			res.Reqs.CmpRequests = bench.CmpRequests{
-				AvgObjSize: a.ObjSize/int64(a.MergedEntries) - b.ObjSize/int64(b.MergedEntries),
+				AvgObjSize: avgObjSize(a.ObjSize, a.MergedEntries) - avgObjSize(b.ObjSize, b.MergedEntries),
 				Requests:   a.Requests - b.Requests,
-				Average:    time.Duration((a.DurAvgMillis*aInv - b.DurMedianMillis*bInv) * ms).Round(round),
+				Average:    time.Duration((a.DurAvgMillis - b.DurAvgMillis) * ms).Round(round),
 				Worst:      time.Duration((a.SlowestMillis - b.SlowestMillis) * ms).Round(round),
 				Best:       time.Duration((a.FastestMillis - b.FastestMillis) * ms).Round(round),
-				Median:     time.Duration((a.DurMedianMillis*aInv - b.DurMedianMillis*bInv) * ms).Round(round),
-				P90:        time.Duration((a.Dur90Millis*aInv - b.Dur90Millis*bInv) * ms).Round(round),
-				P99:        time.Duration((a.Dur99Millis*aInv - b.Dur99Millis*bInv) * ms).Round(round),
-				StdDev:     time.Duration((a.StdDev*aInv - b.StdDev*bInv) * ms).Round(round),
+				Median:     time.Duration((a.DurMedianMillis - b.DurMedianMillis) * ms).Round(round),
+				P90:        time.Duration((a.Dur90Millis - b.Dur90Millis) * ms).Round(round),
+				P99:        time.Duration((a.Dur99Millis - b.Dur99Millis) * ms).Round(round),
+				StdDev:     time.Duration((a.StdDev - b.StdDev) * ms).Round(round),
 			}
 			res.Reqs.Before = bench.CmpRequests{
-				AvgObjSize: b.ObjSize / int64(b.MergedEntries),
+				AvgObjSize: avgObjSize(b.ObjSize, b.MergedEntries),
 				Requests:   b.Requests,
-				Average:    time.Duration(b.DurAvgMillis * bInv * ms).Round(round),
+				Average:    time.Duration(b.DurAvgMillis * ms).Round(round),
 				Worst:      time.Duration(b.SlowestMillis * ms).Round(round),
 				Best:       time.Duration(b.FastestMillis * ms).Round(round),
-				Median:     time.Duration(b.DurMedianMillis * bInv * ms).Round(round),
-				P90:        time.Duration(b.Dur90Millis * bInv * ms).Round(round),
-				P99:        time.Duration(b.Dur99Millis * bInv * ms).Round(round),
-				StdDev:     time.Duration(b.StdDev * bInv * ms).Round(round),
+				Median:     time.Duration(b.DurMedianMillis * ms).Round(round),
+				P90:        time.Duration(b.Dur90Millis * ms).Round(round),
+				P99:        time.Duration(b.Dur99Millis * ms).Round(round),
+				StdDev:     time.Duration(b.StdDev * ms).Round(round),
 			}
 			res.Reqs.After = bench.CmpRequests{
-				AvgObjSize: a.ObjSize / int64(a.MergedEntries),
+				AvgObjSize: avgObjSize(a.ObjSize, a.MergedEntries),
 				Requests:   a.Requests,
-				Average:    time.Duration(a.DurAvgMillis * aInv * ms).Round(round),
+				Average:    time.Duration(a.DurAvgMillis * ms).Round(round),
 				Worst:      time.Duration(a.SlowestMillis * ms).Round(round),
 				Best:       time.Duration(a.FastestMillis * ms).Round(round),
-				Median:     time.Duration(a.DurMedianMillis * aInv * ms).Round(round),
-				P90:        time.Duration(a.Dur90Millis * aInv * ms).Round(round),
-				P99:        time.Duration(a.Dur99Millis * aInv * ms).Round(round),
-				StdDev:     time.Duration(a.StdDev * aInv * ms).Round(round),
+				Median:     time.Duration(a.DurMedianMillis * ms).Round(round),
+				P90:        time.Duration(a.Dur90Millis * ms).Round(round),
+				P99:        time.Duration(a.Dur99Millis * ms).Round(round),
+				StdDev:     time.Duration(a.StdDev * ms).Round(round),
 			}
+			// Compare TTFB if both have it
 			if a.FirstByte != nil && b.FirstByte != nil {
-				res.TTFB = b.FirstByte.AsBench(b.MergedEntries).Compare(a.FirstByte.AsBench(a.MergedEntries))
+				res.TTFB = b.FirstByte.Compare(*a.FirstByte)
 			}
 		}
 	}

@@ -165,67 +165,6 @@ func plusPositiveF(f float64) string {
 	}
 }
 
-// TTFBCmp is a comparison between two TTFB runs.
-type TTFBCmp struct {
-	TTFB
-	Before, After TTFB
-}
-
-// Compare will set t to the difference between before and after.
-func (t TTFB) Compare(after TTFB) *TTFBCmp {
-	if t.Average == 0 {
-		return nil
-	}
-	return &TTFBCmp{
-		TTFB: TTFB{
-			Average: after.Average - t.Average,
-			Worst:   after.Worst - t.Worst,
-			Best:    after.Best - t.Best,
-			Median:  after.Median - t.Median,
-			P25:     after.P25 - t.P25,
-			P75:     after.P75 - t.P75,
-			P90:     after.P90 - t.P90,
-			P99:     after.P99 - t.P99,
-			StdDev:  after.StdDev - t.StdDev,
-		},
-		Before: t,
-		After:  after,
-	}
-}
-
-// String returns a human readable representation of the TTFB comparison.
-func (t *TTFBCmp) String() string {
-	if t == nil {
-		return ""
-	}
-	return fmt.Sprintf("Avg: %s%v (%s%.f%%), P50: %s%v (%s%.f%%), P99: %s%v (%s%.f%%), Best: %s%v (%s%.f%%), Worst: %s%v (%s%.f%%) StdDev: %s%v (%s%.f%%)",
-		plusPositiveD(t.Average),
-		t.Average.Round(time.Millisecond/20),
-		plusPositiveD(t.Average),
-		100*(float64(t.After.Average)-float64(t.Before.Average))/float64(t.Before.Average),
-		plusPositiveD(t.Median),
-		t.Median,
-		plusPositiveD(t.Median),
-		100*(float64(t.After.Median)-float64(t.Before.Median))/float64(t.Before.Median),
-		plusPositiveD(t.P99),
-		t.P99,
-		plusPositiveD(t.P99),
-		100*(float64(t.After.P99)-float64(t.Before.P99))/float64(t.Before.P99),
-		plusPositiveD(t.Best),
-		t.Best,
-		plusPositiveD(t.Best),
-		100*(float64(t.After.Best)-float64(t.Before.Best))/float64(t.Before.Best),
-		plusPositiveD(t.Worst),
-		t.Worst,
-		plusPositiveD(t.Worst),
-		100*(float64(t.After.Worst)-float64(t.Before.Worst))/float64(t.Before.Worst),
-		plusPositiveD(t.StdDev),
-		t.StdDev,
-		plusPositiveD(t.StdDev),
-		100*(float64(t.After.StdDev)-float64(t.Before.StdDev))/float64(t.Before.StdDev),
-	)
-}
-
 func plusPositiveD(d time.Duration) string {
 	switch {
 	case d > 0:
@@ -278,11 +217,20 @@ func Compare(before, after Operations, analysis time.Duration, allThreads bool) 
 	res.Slowest.Compare(bs.Median(0.0), as.Median(0.0))
 	res.Fastest.Compare(bs.Median(1), as.Median(1))
 
-	beforeTotals, beforeTTFB := before.Total(allThreads), before.TTFB(before.TimeRange())
-	afterTotals, afterTTFB := after.Total(allThreads), after.TTFB(after.TimeRange())
+	beforeTotals := before.Total(allThreads)
+	afterTotals := after.Total(allThreads)
 	res.Reqs.Compare(before, after)
 
 	res.Average.Compare(beforeTotals, afterTotals)
-	res.TTFB = beforeTTFB.Compare(afterTTFB)
+
+	// Compare TTFB
+	beforeStart, beforeEnd := before.TimeRange()
+	afterStart, afterEnd := after.TimeRange()
+	beforeTTFB := TtfbFromOps(before, beforeStart, beforeEnd)
+	afterTTFB := TtfbFromOps(after, afterStart, afterEnd)
+	if beforeTTFB != nil && afterTTFB != nil {
+		res.TTFB = beforeTTFB.Compare(*afterTTFB)
+	}
+
 	return &res, nil
 }

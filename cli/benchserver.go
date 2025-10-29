@@ -636,6 +636,7 @@ func (c *connections) downloadAggr() aggregate.Realtime {
 		}(i)
 	}
 	wg.Wait()
+	res.Final = true
 	return res
 }
 

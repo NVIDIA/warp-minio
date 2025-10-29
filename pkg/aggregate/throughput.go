@@ -1,5 +1,6 @@
 /*
  * Warp (C) 2019-2020 MinIO, Inc.
+ * Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -121,7 +122,12 @@ func (t Throughput) StringDetails(details bool) string {
 	}
 	speed := ""
 	if t.Bytes > 0 {
-		speed = fmt.Sprintf("%.02f MiB/s, ", t.BytesPS()/(1<<20))
+		// Include ± stddev if segmented stats are present
+		if t.Segmented != nil && t.Segmented.StdDevBPS > 0 {
+			speed = fmt.Sprintf("%.02f MiB/s (± %.02f), ", t.BytesPS()/(1<<20), bench.Throughput(t.Segmented.StdDevBPS)/(1<<20))
+		} else {
+			speed = fmt.Sprintf("%.02f MiB/s, ", t.BytesPS()/(1<<20))
+		}
 	}
 	errs := ""
 	if t.Errors > 0 {
@@ -135,12 +141,16 @@ func (t Throughput) StringDetails(details bool) string {
 	if t.Objects == 0 {
 		unit = "ops/s"
 	}
-	opsPerSec := t.ObjectsPS()
+	rate := t.ObjectsPS()
 	if t.Objects == 0 && t.Operations > 0 {
-		opsPerSec = t.OpsPS()
+		rate = t.OpsPS()
+	}
+	if t.Segmented != nil && t.Segmented.StdDevOPS > 0 {
+		return fmt.Sprintf("%s%.02f %s (± %.02f)%s%s",
+			speed, rate, unit, t.Segmented.StdDevOPS, errs, dur)
 	}
 	return fmt.Sprintf("%s%.02f %s%s%s",
-		speed, opsPerSec, unit, errs, dur)
+		speed, rate, unit, errs, dur)
 }
 
 func (t *Throughput) fill(total bench.Segment) {
@@ -181,6 +191,11 @@ type ThroughputSegmented struct {
 	MedianOPS  float64 `json:"median_ops"`
 	SlowestBPS float64 `json:"slowest_bps"`
 	SlowestOPS float64 `json:"slowest_ops"`
+
+	// Standard deviation across 1s segments.
+	// Computed after segments are finalized/merged.
+	StdDevBPS float64 `json:"stddev_bps,omitempty"`
+	StdDevOPS float64 `json:"stddev_ops,omitempty"`
 }
 
 type SegmentsSmall []SegmentSmall
@@ -346,6 +361,50 @@ func (s SegmentSmall) StringLongOp(d time.Duration, details bool, objects float6
 		speed, s.OPS, unit, detail)
 }
 
+// updateDerivedStdDevs computes standard deviations for BPS and OPS from segments.
+func (t *ThroughputSegmented) updateDerivedStdDevs() {
+	if len(t.Segments) <= 1 {
+		return
+	}
+
+	// BPS standard deviation (skip zero BPS segments)
+	var sumBps, sumSqBps float64
+	var countBps int
+	for _, s := range t.Segments {
+		if s.BPS <= 0 {
+			continue
+		}
+		sumBps += s.BPS
+		sumSqBps += s.BPS * s.BPS
+		countBps++
+	}
+	if countBps > 1 {
+		n := float64(countBps)
+		varVar := (sumSqBps - (sumBps*sumBps)/n) / (n - 1)
+		if varVar < 0 {
+			varVar = 0
+		}
+		t.StdDevBPS = math.Sqrt(varVar)
+	}
+
+	// OPS standard deviation
+	var sumOps, sumSqOps float64
+	var countOps int
+	for _, s := range t.Segments {
+		sumOps += s.OPS
+		sumSqOps += s.OPS * s.OPS
+		countOps++
+	}
+	if countOps > 1 {
+		n := float64(countOps)
+		varVar := (sumSqOps - (sumOps*sumOps)/n) / (n - 1)
+		if varVar < 0 {
+			varVar = 0
+		}
+		t.StdDevOPS = math.Sqrt(varVar)
+	}
+}
+
 func (t *ThroughputSegmented) fill(segs bench.Segments, totalBytes int64) {
 	// Copy by time.
 	segs.SortByTime()
@@ -403,6 +462,8 @@ func (t *ThroughputSegmented) fill(segs bench.Segments, totalBytes int64) {
 		SlowestBPS:            bps(slow),
 		SlowestOPS:            ops(slow),
 	}
+	// Compute standard deviations from segments
+	t.updateDerivedStdDevs()
 }
 
 func (t *ThroughputSegmented) fillFromSegs() {
@@ -442,4 +503,6 @@ func (t *ThroughputSegmented) fillFromSegs() {
 		SlowestBPS:            slow.BPS,
 		SlowestOPS:            slow.OPS,
 	}
+	// Compute standard deviations from segments
+	t.updateDerivedStdDevs()
 }

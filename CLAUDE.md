@@ -74,11 +74,13 @@ The packages follow a layered dependency structure:
 - Each operation type implements the Benchmark interface (get.go, put.go, mixed.go, etc.)
 - `ops.go` - Reusable operation functions (upload, download, delete operations)
 - `collector.go` - Real-time operation statistics collection
+- `histogram.go` - Histogram implementations (LatencyHistogram for durations, BpsHistogram for throughput)
+- `ttfb.go` - Time-to-first-byte statistics and comparison
 
 **pkg/aggregate/** - Data aggregation and analysis (imports pkg/bench)
 - `aggregate.go` - Aggregates raw operation data into statistics
 - `throughput.go` - Throughput calculations and statistics
-- `requests.go` - Per-request statistics (latency, TTFB, percentiles)
+- `requests.go` - Per-request statistics (latency/TTFB and per-op B/s) with histograms for accurate percentiles across merges
 - `compare.go` - Comparison between benchmark runs
 - `live.go` - Live statistics updates during benchmark runs
 
@@ -116,12 +118,25 @@ The packages follow a layered dependency structure:
 - Sent to `Collector` which batches and compresses to `.csv.zst` files
 - Format: Tab-separated values with fields like idx, thread, op, client_id, n_objects, bytes, etc.
 
+**Statistics and Histograms:**
+- Histograms enable accurate percentile calculation across distributed client merges
+- `LatencyHistogram`: Records operation durations for latency and TTFB percentiles
+- `BpsHistogram`: Records per-operation throughput (bytes/second) for each operation
+- Per-op throughput calculation: `operation.Size / operation.Duration` (not normalized by object count)
+- `ObjPerOp` field indicates objects per operation:
+  - Typically 1 for standard operations
+  - Can be >1 for: fanout (`--copies`), snowball (`--num-objects`), bulk delete (without `--single-delete`)
+  - For fanout and snowball, Size represents total bytes across all objects
+  - For bulk delete, Size is 0 (no data transferred)
+- Example: Operation with Size=10MB, Duration=1s, ObjPerOp=5 records 10 MB/s (not 2 MB/s per object)
+- Statistics reflect actual operation-level performance as experienced by the benchmark workload
+
 ### Important Files
 
 - `main.go` - Entry point, delegates to `cli.Main()`
 - `cli/cli.go` - Command registration (lines 89-104 list all benchmark commands)
 - `pkg/bench/benchmark.go` - Core Benchmark interface definition
-- `cli/benchmark.go:108` - `runBench()` is the main benchmark runner
+- `cli/benchmark.go:118` - `runBench()` is the main benchmark runner
 
 ## Development Guidelines
 

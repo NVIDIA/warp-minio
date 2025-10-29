@@ -52,20 +52,6 @@ type Segment struct {
 	ObjsPerOp  int       `json:"objects_per_op"`
 }
 
-// TTFB contains time to first byte stats.
-type TTFB struct {
-	Average     time.Duration
-	Best        time.Duration
-	P25         time.Duration
-	Median      time.Duration
-	P75         time.Duration
-	P90         time.Duration
-	P99         time.Duration
-	Worst       time.Duration
-	StdDev      time.Duration
-	Percentiles [101]time.Duration `json:"percentiles_millis"`
-}
-
 // Segments is a slice of segment elements.
 type Segments []Segment
 
@@ -90,51 +76,6 @@ func (o Operations) Total(allThreads bool) Segment {
 		AllThreads:     allThreads,
 		MultiOp:        o.IsMixed(),
 	})[0]
-}
-
-// TTFB returns time to first byte stats for all operations completely within the time segment.
-func (o Operations) TTFB(start, end time.Time) TTFB {
-	if start.After(end) || start.Equal(end) {
-		return TTFB{}
-	}
-
-	filtered := o.FilterByHasTTFB(true).FilterInsideRange(start, end)
-	if len(filtered) == 0 {
-		return TTFB{}
-	}
-	filtered.SortByTTFB()
-
-	res := TTFB{
-		Average: 0,
-		Best:    filtered.Median(0).TTFB(),
-		P25:     filtered.Median(0.25).TTFB(),
-		Median:  filtered.Median(0.5).TTFB(),
-		P75:     filtered.Median(0.75).TTFB(),
-		P90:     filtered.Median(0.9).TTFB(),
-		P99:     filtered.Median(0.99).TTFB(),
-		Worst:   filtered.Median(1).TTFB(),
-	}
-	for i := range res.Percentiles[:] {
-		res.Percentiles[i] = filtered.Median(float64(i) / 100).TTFB()
-	}
-
-	for _, op := range filtered {
-		ttfb := op.TTFB()
-		res.Average += ttfb
-	}
-	avg := float64(res.Average) / float64(len(filtered))
-	res.Average /= time.Duration(len(filtered))
-	res.StdDev = 0
-	if len(filtered) > 1 {
-		var stdDev float64
-		for _, op := range filtered {
-			ttfb := op.TTFB()
-			d := float64(ttfb) - avg
-			stdDev += d * d
-		}
-		res.StdDev = time.Duration(math.Sqrt(stdDev / float64(len(filtered)-1)))
-	}
-	return res
 }
 
 // OpThroughput returns the average throughput in B/s.
@@ -372,13 +313,4 @@ func (s Segments) Median(m float64) Segment {
 	m = math.Max(m, 0)
 	m = math.Min(m, float64(len(s)-1))
 	return s[int(m)]
-}
-
-// String returns a human printable version of the time to first byte.
-func (t TTFB) String() string {
-	if t.Average == 0 {
-		return ""
-	}
-	return fmt.Sprintf("Average: %v, Median: %v, Best: %v, Worst: %v, StdDev: %v",
-		t.Average.Round(time.Millisecond), t.Median.Round(time.Millisecond), t.Best.Round(time.Millisecond), t.Worst.Round(time.Millisecond), t.StdDev.Round(time.Millisecond))
 }

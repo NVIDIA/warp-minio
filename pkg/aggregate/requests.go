@@ -1,5 +1,6 @@
 /*
  * Warp (C) 2019-2020 MinIO, Inc.
+ * Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -19,6 +20,7 @@ package aggregate
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -40,13 +42,17 @@ type SingleSizedRequests struct {
 	LastAccess *SingleSizedRequests `json:"last_access,omitempty"`
 
 	// Time to first byte if applicable.
-	FirstByte *TTFB `json:"first_byte,omitempty"`
+	FirstByte *bench.TTFB `json:"first_byte,omitempty"`
 
 	// Host names, sorted.
 	HostNames MapAsSlice `json:"host_names,omitempty"`
 
-	// DurPct is duration percentiles (milliseconds).
-	DurPct *[101]float64 `json:"dur_percentiles_millis,omitempty"`
+	// DurHist holds the latency histogram; automatically serialized to sparse format.
+	DurHist bench.LatencyHistogram `json:"dur_hist,omitempty"`
+
+	// Internal precise running sums to derive avg/stddev on merges.
+	DurSumMillis   float64 `json:"dur_sum_millis,omitempty"`
+	DurSumSqMillis float64 `json:"dur_sum_sq_millis,omitempty"`
 
 	// Median request duration.
 	DurMedianMillis float64 `json:"dur_median_millis"`
@@ -82,31 +88,47 @@ type SingleSizedRequests struct {
 	MergedEntries int `json:"merged_entries"`
 }
 
-func (a SingleSizedRequests) StringByN() string {
-	n := float64(a.MergedEntries)
-	if a.Requests == 0 || n == 0 {
+func (a SingleSizedRequests) String() string {
+	if a.Requests == 0 {
 		return ""
 	}
-	invN := 1 / n
-	reqs := a
-
 	fmtMillis := func(v float64) string {
-		if v*invN > float64(100*time.Millisecond) {
-			dur := time.Duration(v * float64(time.Millisecond) * invN).Round(time.Millisecond)
+		if v > float64(100*time.Millisecond) {
+			dur := time.Duration(v * float64(time.Millisecond)).Round(time.Millisecond)
 			return dur.String()
 		}
-		return fmt.Sprintf("%.1fms", v*invN)
+		return fmt.Sprintf("%.1fms", v)
 	}
 	return fmt.Sprint(
-		"Avg: ", fmtMillis(reqs.DurAvgMillis),
-		", 50%: ", fmtMillis(reqs.DurMedianMillis),
-		", 90%: ", fmtMillis(reqs.Dur90Millis),
-		", 99%: ", fmtMillis(reqs.Dur99Millis),
-		// These are not accumulated.
-		", Fastest: ", fmtMillis(reqs.FastestMillis*n),
-		", Slowest: ", fmtMillis(reqs.SlowestMillis*n),
-		", StdDev: ", fmtMillis(reqs.StdDev),
+		"Avg: ", fmtMillis(a.DurAvgMillis),
+		", 50%: ", fmtMillis(a.DurMedianMillis),
+		", 90%: ", fmtMillis(a.Dur90Millis),
+		", 99%: ", fmtMillis(a.Dur99Millis),
+		", Fastest: ", fmtMillis(a.FastestMillis),
+		", Slowest: ", fmtMillis(a.SlowestMillis),
+		", StdDev: ", fmtMillis(a.StdDev),
 	)
+}
+
+// updateDerivedDurationStats recomputes all derived duration statistics from source fields
+// (DurSumMillis, DurSumSqMillis, DurHist).
+func (a *SingleSizedRequests) updateDerivedDurationStats() {
+	n := float64(a.DurHist.Samples())
+	if n > 0 {
+		a.DurAvgMillis = a.DurSumMillis / n
+		if n > 1 {
+			variance := (a.DurSumSqMillis - (a.DurSumMillis*a.DurSumMillis)/n) / (n - 1)
+			if variance < 0 {
+				variance = 0
+			}
+			a.StdDev = math.Sqrt(variance)
+		} else {
+			a.StdDev = 0
+		}
+		a.DurMedianMillis = durToMillisF(a.DurHist.Quantile(0.5))
+		a.Dur90Millis = durToMillisF(a.DurHist.Quantile(0.9))
+		a.Dur99Millis = durToMillisF(a.DurHist.Quantile(0.99))
+	}
 }
 
 func (a *SingleSizedRequests) add(b SingleSizedRequests) {
@@ -115,19 +137,19 @@ func (a *SingleSizedRequests) add(b SingleSizedRequests) {
 	}
 	a.Requests += b.Requests
 	a.ObjSize += b.ObjSize
-	a.DurAvgMillis += b.DurAvgMillis
-	a.DurMedianMillis += b.DurMedianMillis
+	// Precise sums for avg/stddev
+	a.DurSumMillis += b.DurSumMillis
+	a.DurSumSqMillis += b.DurSumSqMillis
 	if a.MergedEntries == 0 {
 		a.FastestMillis = b.FastestMillis
 	} else {
 		a.FastestMillis = min(a.FastestMillis, b.FastestMillis)
 	}
 	a.SlowestMillis = max(a.SlowestMillis, b.SlowestMillis)
-	a.Dur99Millis += b.Dur99Millis
-	a.Dur90Millis += b.Dur90Millis
-	a.StdDev += b.StdDev
 	a.MergedEntries += b.MergedEntries
 	a.HostNames.AddMap(b.HostNames)
+	// Merge histograms losslessly
+	a.DurHist.Merge(b.DurHist)
 	if a.ByHost == nil && len(b.ByHost) > 0 {
 		a.ByHost = make(map[string]SingleSizedRequests, len(b.ByHost))
 	}
@@ -136,14 +158,8 @@ func (a *SingleSizedRequests) add(b SingleSizedRequests) {
 		x.add(v)
 		a.ByHost[k] = x
 	}
-	if a.DurPct == nil && b.DurPct == nil {
-		a.DurPct = &[101]float64{}
-	}
-	if b.DurPct != nil {
-		for i := range b.DurPct {
-			a.DurPct[i] += b.DurPct[i]
-		}
-	}
+	// Recompute all derived duration stats from merged sums and histogram
+	a.updateDerivedDurationStats()
 	if b.FirstAccess != nil {
 		if a.FirstAccess == nil {
 			a.FirstAccess = &SingleSizedRequests{}
@@ -158,30 +174,41 @@ func (a *SingleSizedRequests) add(b SingleSizedRequests) {
 	}
 	if b.FirstByte != nil {
 		if a.FirstByte == nil {
-			a.FirstByte = &TTFB{}
+			a.FirstByte = &bench.TTFB{}
 		}
-		a.FirstByte.add(*b.FirstByte)
+		a.FirstByte.Merge(*b.FirstByte)
 	}
 }
 
 func (a *SingleSizedRequests) fill(ops bench.Operations) {
 	start, end := ops.TimeRange()
-	ops.SortByDuration()
 	a.Requests = len(ops)
 	a.ObjSize = ops.FirstObjSize()
-	a.DurAvgMillis = durToMillisF(ops.AvgDuration())
-	a.StdDev = durToMillisF(ops.StdDev())
-	a.DurMedianMillis = durToMillisF(ops.Median(0.5).Duration())
-	a.Dur90Millis = durToMillisF(ops.Median(0.9).Duration())
-	a.Dur99Millis = durToMillisF(ops.Median(0.99).Duration())
-	a.SlowestMillis = durToMillisF(ops.Median(1).Duration())
-	a.FastestMillis = durToMillisF(ops.Median(0).Duration())
-	a.FirstByte = TtfbFromBench(ops.TTFB(start, end))
-	a.DurPct = &[101]float64{}
-	a.MergedEntries = 1
-	for i := range a.DurPct[:] {
-		a.DurPct[i] = durToMillisF(ops.Median(float64(i) / 100).Duration())
+	// Build latency histogram from operations
+	a.DurHist = bench.NewLatencyHistogram()
+	a.DurSumMillis = 0
+	a.DurSumSqMillis = 0
+	for _, op := range ops {
+		if op.Err != "" {
+			continue
+		}
+		d := op.Duration()
+		a.DurHist.AddDuration(d)
+		ms := durToMillisF(d)
+		a.DurSumMillis += ms
+		a.DurSumSqMillis += ms * ms
+		if a.FastestMillis == 0 || ms < a.FastestMillis {
+			a.FastestMillis = ms
+		}
+		if ms > a.SlowestMillis {
+			a.SlowestMillis = ms
+		}
 	}
+	// Compute derived duration stats from sums and histogram
+	a.updateDerivedDurationStats()
+	// Build TTFB including histogram from operations
+	a.FirstByte = bench.TtfbFromOps(ops, start, end)
+	a.MergedEntries = 1
 }
 
 func (a *SingleSizedRequests) fillFirstLast(ops bench.Operations) {
@@ -199,7 +226,7 @@ func (a *SingleSizedRequests) fillFirstLast(ops bench.Operations) {
 
 type RequestSizeRange struct {
 	// Time to first byte if applicable.
-	FirstByte *TTFB `json:"first_byte,omitempty"`
+	FirstByte *bench.TTFB `json:"first_byte,omitempty"`
 
 	// FirstAccess is filled if the same object is accessed multiple times.
 	// This records the first touch of the object.
@@ -207,9 +234,6 @@ type RequestSizeRange struct {
 
 	MinSizeString string `json:"min_size_string"`
 	MaxSizeString string `json:"max_size_string"`
-
-	// BpsPct is BPS percentiles.
-	BpsPct *[101]float64 `json:"bps_percentiles,omitempty"`
 
 	BpsMedian         float64 `json:"bps_median"`
 	AvgDurationMillis float64 `json:"avg_duration_millis"`
@@ -222,6 +246,7 @@ type RequestSizeRange struct {
 	Bps99      float64 `json:"bps_99"`
 	BpsFastest float64 `json:"bps_fastest"`
 	BpsSlowest float64 `json:"bps_slowest"`
+	BpsStdDev  float64 `json:"bps_std_dev"`
 
 	// Average payload size of requests in bytes.
 	AvgObjSize int `json:"avg_obj_size"`
@@ -232,6 +257,40 @@ type RequestSizeRange struct {
 
 	// MergedEntries is a counter for the number of merged entries contained in this result.
 	MergedEntries int `json:"merged_entries"`
+
+	// BpsHist holds the per-operation throughput histogram; automatically serialized to sparse format.
+	BpsHist bench.BpsHistogram `json:"bps_hist,omitempty"`
+
+	// Internal sums for accurate merged percentiles/average
+	sumBytes int64         `json:"-"`
+	sumDur   time.Duration `json:"-"`
+	sumBps   float64       `json:"-"`
+	sumSqBps float64       `json:"-"`
+	bpsCount int           `json:"-"`
+}
+
+// updateDerivedBpsStats recomputes all derived BPS statistics from source fields
+// (sumBytes, sumDur, sumBps, sumSqBps, bpsCount, BpsHist).
+func (s *RequestSizeRange) updateDerivedBpsStats() {
+	// Compute average from total bytes and duration
+	if s.sumDur > 0 {
+		s.BpsAverage = float64(s.sumBytes) * float64(time.Second) / float64(s.sumDur)
+	}
+	// Compute standard deviation from per-op bps sums
+	if s.bpsCount > 1 {
+		n := float64(s.bpsCount)
+		varVar := (s.sumSqBps - (s.sumBps*s.sumBps)/n) / (n - 1)
+		if varVar < 0 {
+			varVar = 0
+		}
+		s.BpsStdDev = math.Sqrt(varVar)
+	}
+	// Compute percentiles from histogram
+	s.BpsMedian = s.BpsHist.Quantile(0.5)
+	s.Bps90 = s.BpsHist.Quantile(0.9)
+	s.Bps99 = s.BpsHist.Quantile(0.99)
+	s.BpsFastest = s.BpsHist.Quantile(0.0)
+	s.BpsSlowest = s.BpsHist.Quantile(1.0)
 }
 
 func (s RequestSizeRange) String() string {
@@ -244,20 +303,7 @@ func (s RequestSizeRange) String() string {
 		", 99%: ", bench.Throughput(s.Bps99),
 		", Fastest: ", bench.Throughput(s.BpsFastest),
 		", Slowest: ", bench.Throughput(s.BpsSlowest),
-	)
-}
-
-func (s RequestSizeRange) StringByN() string {
-	if s.MergedEntries <= 0 || s.Requests == 0 {
-		return ""
-	}
-	mul := 1 / float64(s.MergedEntries)
-	return fmt.Sprint("Avg: ", bench.Throughput(s.BpsAverage*mul),
-		", 50%: ", bench.Throughput(s.BpsMedian*mul),
-		", 90%: ", bench.Throughput(s.Bps90*mul),
-		", 99%: ", bench.Throughput(s.Bps99*mul),
-		", Fastest: ", bench.Throughput(s.BpsFastest*mul),
-		", Slowest: ", bench.Throughput(s.BpsSlowest*mul),
+		", StdDev: ", bench.Throughput(s.BpsStdDev),
 	)
 }
 
@@ -266,22 +312,36 @@ func (s *RequestSizeRange) fill(ss bench.SizeSegment) {
 	if len(ops) == 0 {
 		return
 	}
+	start, end := ops.TimeRange()
 	s.Requests = len(ops)
 	s.MinSize = int(ss.Smallest)
 	s.MaxSize = int(ss.Biggest)
 	s.MinSizeString, s.MaxSizeString = ss.SizesString()
 	s.AvgObjSize = int(ops.AvgSize())
 	s.AvgDurationMillis = durToMillisF(ops.AvgDuration())
-	s.BpsAverage = ops.OpThroughput().Float()
-	s.BpsMedian = ops.Median(0.5).BytesPerSec().Float()
-	s.Bps90 = ops.Median(0.9).BytesPerSec().Float()
-	s.Bps99 = ops.Median(0.99).BytesPerSec().Float()
-	s.BpsFastest = ops.Median(0.0).BytesPerSec().Float()
-	s.BpsSlowest = ops.Median(1).BytesPerSec().Float()
-	s.BpsPct = &[101]float64{}
-	for i := range s.BpsPct[:] {
-		s.BpsPct[i] = ops.Median(float64(i) / 100).BytesPerSec().Float()
+	// Build per-operation Bps histogram and sums
+	s.BpsHist = bench.NewBpsHistogram()
+	s.sumBytes = 0
+	s.sumDur = 0
+	s.sumBps = 0
+	s.sumSqBps = 0
+	s.bpsCount = 0
+	for _, op := range ops {
+		if op.Duration() <= 0 || op.Size <= 0 {
+			continue
+		}
+		s.sumBytes += op.Size
+		s.sumDur += op.Duration()
+		bps := float64(op.Size) * float64(time.Second) / float64(op.Duration())
+		s.BpsHist.AddBps(bps)
+		s.sumBps += bps
+		s.sumSqBps += bps * bps
+		s.bpsCount++
 	}
+	// Compute derived BPS stats from sums and histogram
+	s.updateDerivedBpsStats()
+	// Build TTFB from operations
+	s.FirstByte = bench.TtfbFromOps(ops, start, end)
 	s.MergedEntries = 1
 }
 
@@ -289,23 +349,23 @@ func (s *RequestSizeRange) add(b RequestSizeRange) {
 	s.Requests += b.Requests
 	if b.FirstByte != nil {
 		if s.FirstByte == nil {
-			s.FirstByte = &TTFB{}
+			s.FirstByte = &bench.TTFB{}
 		}
-		s.FirstByte.add(*b.FirstByte)
+		s.FirstByte.Merge(*b.FirstByte)
 	}
 	// Min/Max should be set
 	s.AvgObjSize += b.AvgObjSize
 	s.AvgDurationMillis += b.AvgDurationMillis
-	s.BpsAverage += b.BpsAverage
-	s.BpsMedian += b.BpsMedian
-	s.BpsFastest += b.BpsFastest
-	s.BpsSlowest += b.BpsSlowest
-	if b.BpsPct != nil {
-		if s.BpsPct == nil {
-			s.BpsPct = &[101]float64{}
-		}
-		s.BpsPct = b.BpsPct
-	}
+	// Merge sums for average
+	s.sumBytes += b.sumBytes
+	s.sumDur += b.sumDur
+	s.sumBps += b.sumBps
+	s.sumSqBps += b.sumSqBps
+	s.bpsCount += b.bpsCount
+	// Merge histogram
+	s.BpsHist.Merge(b.BpsHist)
+	// Recompute all derived BPS stats from merged sums and histogram
+	s.updateDerivedBpsStats()
 	s.MergedEntries += b.MergedEntries
 }
 
@@ -414,7 +474,6 @@ func (a *MultiSizedRequests) fill(ops bench.Operations, fillFirstAccess bool) {
 			if fillFirstAccess {
 				r.fillFirstAccess(s)
 			}
-			r.FirstByte = TtfbFromBench(s.Ops.TTFB(start, end))
 			// Store
 			a.BySize[i] = r
 		}(i)
@@ -498,7 +557,6 @@ func RequestAnalysisMultiSized(o bench.Operations, allThreads bool) *MultiSizedR
 
 // RequestAnalysisHostsMultiSized performs host analysis where objects have different sizes.
 func RequestAnalysisHostsMultiSized(o bench.Operations) map[string]RequestSizeRange {
-	start, end := o.TimeRange()
 	eps := o.SortSplitByEndpoint()
 	if len(eps) == 1 {
 		cl := o.SortSplitByClient(clientAsHostPrefix)
@@ -522,7 +580,6 @@ func RequestAnalysisHostsMultiSized(o bench.Operations) map[string]RequestSizeRa
 			}
 			a := RequestSizeRange{}
 			a.fill(ops.SingleSizeSegment())
-			a.FirstByte = TtfbFromBench(ops.TTFB(start, end))
 			mu.Lock()
 			res[ep] = a
 			mu.Unlock()

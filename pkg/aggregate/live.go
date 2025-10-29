@@ -1,5 +1,6 @@
 /*
  * Warp (C) 2019-2025 MinIO, Inc.
+ * Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -35,7 +36,7 @@ import (
 	"github.com/minio/warp/pkg/bench"
 )
 
-const currentVersion = 2
+const currentVersion = 3
 
 // Realtime is a collection of realtime aggregated data.
 type Realtime struct {
@@ -82,6 +83,8 @@ type LiveAggregate struct {
 	Clients MapAsSlice `json:"clients"`
 
 	throughput liveThroughput
+	// Per-client live throughput segments to enable per-client stddev in reports
+	throughputByClient map[string]liveThroughput
 
 	// Throughput information.
 	Throughput Throughput `json:"throughput"`
@@ -95,6 +98,10 @@ type LiveAggregate struct {
 	// Requests segmented.
 	// Indexed by client.
 	Requests map[string]RequestSegments `json:"requests_by_client"`
+
+	// RequestsTotal contains combined request statistics merged across all clients,
+	// for the full time range, without per-client segmentation.
+	RequestsTotal *RequestsCombined `json:"requests_total,omitempty"`
 
 	requests map[string]liveRequests
 
@@ -113,6 +120,14 @@ type RequestSegment struct {
 }
 
 type RequestSegments []RequestSegment
+
+// RequestsCombined contains combined request statistics merged across clients.
+// Only one of Single or Multi will be populated depending on whether multiple
+// object sizes were observed across the run.
+type RequestsCombined struct {
+	Multi  *MultiSizedRequests  `json:"multi_sized_requests,omitempty"`
+	Single *SingleSizedRequests `json:"single_sized_requests,omitempty"`
+}
 
 const maxFirstErrors = 10
 
@@ -152,6 +167,13 @@ func (l *LiveAggregate) Add(o bench.Operation) {
 	l.ThroughputByHost[o.Endpoint] = l.ThroughputByHost[o.Endpoint].Add(o)
 	l.ThroughputByClient[o.ClientID] = l.ThroughputByClient[o.ClientID].Add(o)
 	l.throughput.Add(o)
+	// Track per-client live throughput to compute per-client stddev later
+	if l.throughputByClient == nil {
+		l.throughputByClient = make(map[string]liveThroughput, 10)
+	}
+	lt := l.throughputByClient[o.ClientID]
+	lt.Add(o)
+	l.throughputByClient[o.ClientID] = lt
 	if l.requests == nil {
 		l.requests = make(map[string]liveRequests, 10)
 	}
@@ -204,6 +226,23 @@ func (l *LiveAggregate) Merge(l2 LiveAggregate) {
 			l.ThroughputByClient[k] = v0
 		}
 	}
+	// Merge RequestsTotal
+	if l.RequestsTotal == nil && l2.RequestsTotal != nil {
+		l.RequestsTotal = l2.RequestsTotal
+	} else if l.RequestsTotal != nil && l2.RequestsTotal != nil {
+		// Merge single-sized requests if both exist
+		if l.RequestsTotal.Single != nil && l2.RequestsTotal.Single != nil {
+			l.RequestsTotal.Single.add(*l2.RequestsTotal.Single)
+		} else if l.RequestsTotal.Single == nil && l2.RequestsTotal.Single != nil {
+			l.RequestsTotal.Single = l2.RequestsTotal.Single
+		}
+		// Merge multi-sized requests if both exist
+		if l.RequestsTotal.Multi != nil && l2.RequestsTotal.Multi != nil {
+			l.RequestsTotal.Multi.add(*l2.RequestsTotal.Multi)
+		} else if l.RequestsTotal.Multi == nil && l2.RequestsTotal.Multi != nil {
+			l.RequestsTotal.Multi = l2.RequestsTotal.Multi
+		}
+	}
 	if l.Title == "" && l2.Title != "" {
 		l.Title = l2.Title
 	}
@@ -248,7 +287,23 @@ func (l LiveAggregate) Update() LiveAggregate {
 }
 
 func (l *LiveAggregate) Finalize() {
-	l.Throughput = l.throughput.asThroughput()
+	// Only overwrite Throughput from live segments when we actually have segment data.
+	// On the coordinator, merged aggregates carry Throughput but not live segments;
+	// in that case, keep the already-merged totals intact.
+	if len(l.throughput.segments) > 0 {
+		l.Throughput = l.throughput.asThroughput()
+	}
+	// Populate per-client Throughput with segmented stats when present
+	if len(l.throughputByClient) > 0 {
+		if l.ThroughputByClient == nil {
+			l.ThroughputByClient = make(map[string]Throughput, len(l.throughputByClient))
+		}
+		for client, lt := range l.throughputByClient {
+			if len(lt.segments) > 0 {
+				l.ThroughputByClient[client] = lt.asThroughput()
+			}
+		}
+	}
 	for clientID, reqs := range l.requests {
 		reqs.cycle()
 		startTime := time.Unix(reqs.firstSeg, 0)
@@ -266,6 +321,25 @@ func (l *LiveAggregate) Finalize() {
 			l.Requests = make(map[string]RequestSegments, 1)
 		}
 		l.Requests[clientID] = dst
+	}
+
+	// Compute combined request statistics across all clients
+	// Only compute if not already populated (e.g., from a merge operation)
+	if len(l.Requests) > 0 && l.RequestsTotal == nil {
+		ss, ms := mergeRequests(l.Requests)
+		var rc RequestsCombined
+		if ss.MergedEntries > 0 || ss.Requests > 0 {
+			// Histograms automatically serialize to sparse format via MarshalJSON
+			rc.Single = &ss
+		}
+		if ms.MergedEntries > 0 || ms.Requests > 0 {
+			// No change needed; per-range histograms already sparse in JSON
+			rc.Multi = &ms
+		}
+		// Only set if we have any data
+		if rc.Single != nil || rc.Multi != nil {
+			l.RequestsTotal = &rc
+		}
 	}
 	l.Title += " (Final)"
 }
@@ -364,18 +438,18 @@ func (l LiveAggregate) Report(op string, o ReportOptions) string {
 	if !o.SkipReqs {
 		ss, ms := mergeRequests(data.Requests)
 		if ss.MergedEntries > 0 {
-			printfColor(color.FgWhite, " * Reqs: %s\n", ss.StringByN())
+			printfColor(color.FgWhite, " * Reqs: %s\n", ss.String())
 			if ss.FirstByte != nil {
-				printfColor(color.FgWhite, " * TTFB: %v\n", ss.FirstByte.StringByN(ss.MergedEntries))
+				printfColor(color.FgWhite, " * TTFB: %v\n", ss.FirstByte.String())
 			}
 		}
 		if ms.MergedEntries > 0 {
 			ms.BySize.SortbySize()
 			for _, s := range ms.BySize {
 				printfColor(color.FgWhite, "\nRequest size %s -> %s . Requests: %d\n", s.MinSizeString, s.MaxSizeString, s.Requests)
-				printfColor(color.FgWhite, " * Reqs: %s \n", s.StringByN())
+				printfColor(color.FgWhite, " * Reqs: %s \n", s.String())
 				if s.FirstByte != nil {
-					printfColor(color.FgWhite, " * TTFB: %s\n", s.FirstByte.StringByN(s.MergedEntries))
+					printfColor(color.FgWhite, " * TTFB: %s\n", s.FirstByte.String())
 				}
 			}
 		}
@@ -416,9 +490,9 @@ func (l LiveAggregate) Report(op string, o ReportOptions) string {
 				}
 			}
 			if ss.MergedEntries > 0 {
-				printfColor(color.FgWhite, " * Reqs: %s", ss.StringByN())
+				printfColor(color.FgWhite, " * Reqs: %s", ss.String())
 				if ss.FirstByte != nil {
-					printfColor(color.FgWhite, "\n * TTFB: %v\n", ss.FirstByte.StringByN(ss.MergedEntries))
+					printfColor(color.FgWhite, "\n * TTFB: %v\n", ss.FirstByte.String())
 				} else {
 					dst.WriteByte('\n')
 				}
@@ -427,9 +501,9 @@ func (l LiveAggregate) Report(op string, o ReportOptions) string {
 				ms.BySize.SortbySize()
 				for _, s := range ms.BySize {
 					printfColor(color.FgWhite, "\nRequest size %s -> %s . Requests: %d\n", s.MinSizeString, s.MaxSizeString, s.Requests)
-					printfColor(color.FgWhite, " * Reqs: %s", s.StringByN())
+					printfColor(color.FgWhite, " * Reqs: %s", s.String())
 					if s.FirstByte != nil {
-						printfColor(color.FgWhite, ", TTFB: %s\n", s.FirstByte.StringByN(s.MergedEntries))
+						printfColor(color.FgWhite, ", TTFB: %s\n", s.FirstByte.String())
 					} else {
 						dst.WriteByte('\n')
 					}
@@ -943,12 +1017,6 @@ func (l *liveRequests) cycle() {
 		var tmp MultiSizedRequests
 		tmp.fill(l.ops, false)
 		// Remove some bonus fields...
-		for k := range tmp.BySize {
-			tmp.BySize[k].BpsPct = nil
-			if tmp.BySize[k].FirstByte != nil {
-				tmp.BySize[k].FirstByte.PercentilesMillis = nil
-			}
-		}
 		tmp.ByHost = nil
 		l.multi = append(l.multi, tmp)
 	} else {
@@ -956,10 +1024,6 @@ func (l *liveRequests) cycle() {
 		tmp.fill(l.ops)
 		// Remove some fields that are excessive...
 		tmp.ByHost = nil
-		tmp.DurPct = nil
-		if tmp.FirstByte != nil {
-			tmp.FirstByte.PercentilesMillis = nil
-		}
 		l.single = append(l.single, tmp)
 	}
 	l.ops = l.ops[:0]
