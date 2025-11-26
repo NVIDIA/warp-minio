@@ -1,5 +1,6 @@
 /*
  * Warp (C) 2019-2020 MinIO, Inc.
+ * Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -103,6 +104,16 @@ var benchFlags = []cli.Flag{
 		Usage:  "Add user tag to all objects using the format <key>=<value>. Random value can be set with 'rand:%length'. Can be used multiple times. Example: --tag foo=bar --tag randomValue=rand:1024.",
 		Hidden: true,
 	},
+}
+
+// getClientID returns a client ID consisting of the short hostname and a random string of specified length.
+func getClientID(randChars int) string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+	shortHostname := strings.Split(hostname, ".")[0]
+	return fmt.Sprintf("%s-%s", shortHostname, pRandASCII(randChars))
 }
 
 // runBench will run the supplied benchmark and save/print the analysis.
@@ -217,7 +228,7 @@ func runBench(ctx *cli.Context, b bench.Benchmark) error {
 	}()
 
 	fileName := ctx.String("benchdata")
-	cID := pRandASCII(4)
+	cID := getClientID(4)
 	if fileName == "" {
 		fileName = fmt.Sprintf("%s-%s-%s-%s", appName, ctx.Command.Name, time.Now().Format("2006-01-02[150405]"), cID)
 	}
@@ -487,7 +498,7 @@ func runClientBenchmark(ctx *cli.Context, b bench.Benchmark, cb *clientBenchmark
 	}()
 
 	fileName := ctx.String("benchdata")
-	cID := pRandASCII(6)
+	cID := getClientID(6)
 	if fileName == "" {
 		fileName = fmt.Sprintf("%s-%s-%s-%s", appName, ctx.Command.Name, time.Now().Format("2006-01-02[150405]"), cID)
 	}
@@ -572,7 +583,7 @@ func addCollector(ctx *cli.Context, b bench.Benchmark) (bench.OpsCollector, chan
 
 	if !ctx.Bool("full") {
 		updates := make(chan aggregate.UpdateReq, 1000)
-		c := aggregate.LiveCollector(context.Background(), updates, pRandASCII(4), common.ExtraOut)
+		c := aggregate.LiveCollector(context.Background(), updates, getClientID(4), common.ExtraOut)
 		common.Collector = c
 		return bench.EmptyOpsCollector, updates
 	}

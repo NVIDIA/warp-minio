@@ -1118,19 +1118,6 @@ func StreamOperationsFromCSV(r io.Reader, analyzeOnly bool, offset, limit int, l
 	for i, s := range header {
 		fieldIdx[s] = i
 	}
-	clientMap := make(map[string]string, 16)
-	cb := byte('a')
-	getClient := func(c string) string {
-		if !analyzeOnly {
-			return c
-		}
-		if v, ok := clientMap[c]; ok {
-			return v
-		}
-		clientMap[c] = string([]byte{cb})
-		cb++
-		return clientMap[c]
-	}
 	fileMap := func(s string) string {
 		return s
 	}
@@ -1230,7 +1217,7 @@ func StreamOperationsFromCSV(r io.Reader, analyzeOnly bool, offset, limit int, l
 			File:       file,
 			Thread:     uint32(thread),
 			Endpoint:   endpoint,
-			ClientID:   getClient(clientID),
+			ClientID:   clientID,
 			Categories: cat,
 		}
 		n++
