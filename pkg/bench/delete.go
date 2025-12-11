@@ -39,7 +39,7 @@ type Delete struct {
 	BatchSize     int
 	ListExisting  bool
 	ListFlat      bool
-	ListPrefix    string
+	ListPrefixes  []string
 }
 
 // Prepare will create an empty bucket or delete any content already there
@@ -51,7 +51,7 @@ func (d *Delete) Prepare(ctx context.Context) error {
 	if d.ListExisting {
 		objects, err := d.listExistingObjects(ctx, ListObjectsConfig{
 			Bucket:        d.Bucket,
-			Prefix:        d.ListPrefix,
+			Prefixes:      d.ListPrefixes,
 			ListFlat:      d.ListFlat,
 			CreateObjects: d.CreateObjects,
 			Shuffle:       true,

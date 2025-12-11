@@ -35,8 +35,8 @@ type Get struct {
 	Common
 
 	// Default Get options.
-	GetOpts    minio.GetObjectOptions
-	ListPrefix string
+	GetOpts      minio.GetObjectOptions
+	ListPrefixes []string
 
 	objects       generator.Objects
 	CreateObjects int
@@ -54,7 +54,7 @@ func (g *Get) Prepare(ctx context.Context) error {
 	if g.ListExisting {
 		objects, err := g.listExistingObjects(ctx, ListObjectsConfig{
 			Bucket:         g.Bucket,
-			Prefix:         g.ListPrefix,
+			Prefixes:       g.ListPrefixes,
 			ListFlat:       g.ListFlat,
 			CreateObjects:  g.CreateObjects,
 			FilterZeroSize: true,

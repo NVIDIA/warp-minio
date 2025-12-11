@@ -1,5 +1,6 @@
 /*
  * Warp (C) 2019-2020 MinIO, Inc.
+ * Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
@@ -22,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"path"
 	"sync/atomic"
 	"time"
 
@@ -107,11 +109,12 @@ func randomOptsDefaults() RandomOpts {
 }
 
 type randomSrc struct {
-	source  trackingReader
-	rng     *rand.Rand
-	obj     Object
-	o       Options
-	counter atomic.Uint64
+	source       trackingReader
+	rng          *rand.Rand
+	obj          Object
+	o            Options
+	counter      atomic.Uint64
+	randomSuffix string // Per-thread random suffix (generated once, reused for all objects)
 }
 
 func newRandom(o Options) (Source, error) {
@@ -141,9 +144,17 @@ func newRandom(o Options) (Source, error) {
 			Name:        "",
 			ContentType: "application/octet-stream",
 			Size:        0,
-			Prefix:      o.GeneratePrefix(),
 		},
 	}
+
+	// Generate random suffix once per thread (if randomPrefix > 0)
+	// This preserves the original semantic: random suffix differentiates threads
+	if o.randomPrefix > 0 {
+		b := make([]byte, o.randomPrefix)
+		randASCIIBytes(b, r.rng)
+		r.randomSuffix = string(b)
+	}
+
 	return &r, nil
 }
 
@@ -152,6 +163,25 @@ func (r *randomSrc) Object() *Object {
 	var nBuf [16]byte
 	randASCIIBytes(nBuf[:], r.rng)
 	r.obj.Size = r.o.getSize(r.rng)
+
+	// Compute prefix: round-robin custom prefixes + optional random suffix
+	var customPrefix string
+	if len(r.o.customPrefixes) > 0 {
+		// Round-robin selection from the list of custom prefixes
+		customPrefix = r.o.customPrefixes[(n-1)%uint64(len(r.o.customPrefixes))]
+	}
+
+	if r.o.randomPrefix <= 0 {
+		r.obj.Prefix = customPrefix
+	} else {
+		// Use the per-thread random suffix (generated once) to preserve thread differentiation
+		if customPrefix == "" {
+			r.obj.Prefix = r.randomSuffix
+		} else {
+			r.obj.Prefix = path.Join(customPrefix, r.randomSuffix)
+		}
+	}
+
 	r.obj.setName(fmt.Sprintf("%d.%s.rnd", n, string(nBuf[:])))
 
 	r.source.ResetSize(r.obj.Size)

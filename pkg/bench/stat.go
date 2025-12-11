@@ -34,8 +34,8 @@ type Stat struct {
 	Common
 
 	// Default Stat options.
-	StatOpts   minio.StatObjectOptions
-	ListPrefix string
+	StatOpts     minio.StatObjectOptions
+	ListPrefixes []string
 
 	objects       generator.Objects
 	CreateObjects int
@@ -52,7 +52,7 @@ func (g *Stat) Prepare(ctx context.Context) error {
 	if g.ListExisting {
 		objects, err := g.listExistingObjects(ctx, ListObjectsConfig{
 			Bucket:         g.Bucket,
-			Prefix:         g.ListPrefix,
+			Prefixes:       g.ListPrefixes,
 			ListFlat:       g.ListFlat,
 			CreateObjects:  g.CreateObjects,
 			FilterZeroSize: true,
