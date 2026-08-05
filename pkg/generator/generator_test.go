@@ -20,7 +20,6 @@ package generator
 
 import (
 	"io"
-	"io/ioutil"
 	"strings"
 	"testing"
 )
@@ -78,7 +77,7 @@ func TestNew(t *testing.T) {
 				t.Errorf("Expected 0, got %v", n)
 				return
 			}
-			b, err = ioutil.ReadAll(obj.Reader)
+			b, err = io.ReadAll(obj.Reader)
 			if err != nil {
 				t.Error(err)
 				return
